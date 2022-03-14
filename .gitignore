@@ -1,0 +1,33 @@
+data/
+fig/
+model/backup
+model/from_DGX
+model/from_RTX30
+model/from_RTX90
+model/neural_spike
+model/spike_binned
+plot
+메모리분석.txt
+할일.txt
+할일2.txt
+할일3.txt
+generate_data.py
+generate_spike_with_dec.py
+JH_exp.zip
+pallet copy.py
+pallet.py
+Python Execution Instruction.xlsx
+RSYNC Instruction.txt
+test.py
+TODO3.txt
+toy_example.py
+tr_relu_backup.py
+train_memory_test.py
+train_nri_argmax.py
+train_phase2.py
+train_ss_w_pin.py
+plot_nriarg.py
+plot_perturb.py
+plot_ss_w_pin.py
+plot_ss_wo_pin.py
+plot.py
