@@ -2,7 +2,7 @@ Neural relational inference using perturbation through deep generative model
 
 Related Papers  
 
-    1. https://www.nature.com/articles/s41593-020-0699-2  
+    1. [https://www.nature.com/articles/s41593-020-0699-2] (https://www.nature.com/articles/s41593-020-0699-2)  
     
     2. https://arxiv.org/abs/1802.04687  
     
