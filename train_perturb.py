@@ -9,9 +9,9 @@ import torch.nn.functional as F
 from torch.optim import lr_scheduler
 
 import yaml
-from generate_spike import LNP_perturb_bin, LNP_perturb_bin_tar
+from generate_spike import data_spike_poisson_rate
 from model.nri_vsc_wo_pinputs import RNNDecoder_NRI_m2o_perturb
-from model.gts_adj import gts_adj_inf
+from model.gts_adj import gts_adj_inf, gts_adj_inf_cs
 from utils import *
 
 torch.manual_seed(42)
@@ -71,6 +71,13 @@ num_node_features = sim_setting.get('num_node_features') # Fixed(1) in Neural Sp
 history = args.history
 pred_step_p1 = args.pred_step_p1
 pred_step_p2 = args.pred_step_p2
+
+if args.neurons == 'LNP':
+    neuron_type = 'lnp'
+elif args.neurons == 'ring':
+    neuron_type = 'ring'
+else:
+    assert False, 'Invalid neuron type'
 
 data_suffix = sim_setting.get('data') + '/' + args.neurons + str(args.history)
 model_params = settings.get('model_params')
@@ -171,8 +178,12 @@ else:
 device = torch.device(device if torch.cuda.is_available() else 'cpu')
 
 # Define models
-adj_inf_model = gts_adj_inf(num_nodes, enc_hid, args.out_channel, args.kernal_x_1, args.kernal_x_2, 
-                            args.stride_x_1, args.stride_x_2, args.gts_totalstep)
+if args.adj_infstyle == 'circshift':
+    adj_inf_model = gts_adj_inf_cs(num_nodes, enc_hid, args.out_channel, args.kernal_x_1, args.kernal_x_2, 
+                                   args.stride_x_1, args.stride_x_2, args.gts_totalstep)
+elif args.adj_infstyle == 'complete':
+    adj_inf_model = gts_adj_inf(num_nodes, enc_hid, args.out_channel, args.kernal_x_1, args.kernal_x_2, 
+                                args.stride_x_1, args.stride_x_2, args.gts_totalstep)
 decoder = RNNDecoder_NRI_m2o_perturb(num_node_features, dec_hid, sim_setting, 
                                      p1_bs, history, num_nodes, device)                            
 gts_featmat = np.load('data/gts_featuremat.npy')[:, :args.gts_totalstep]
@@ -183,17 +194,33 @@ scheduler = lr_scheduler.StepLR(optimizer, step_size=lr_decay, gamma=gamma)
 
 # Load dataset
 if args.experiment == 'perturb_target_only':
-    trainset = LNP_perturb_bin_tar(history, pred_step_p1, p1_bs, 'train', data_length_ratio)
-    validset = LNP_perturb_bin_tar(history, pred_step_p1, p1_bs, 'valid', data_length_ratio)
+    trainset = data_spike_poisson_rate(history, pred_step_p1, p1_bs, 'train', if_binned=False, 
+                                       neuron_type=neuron_type, recording='pt', length_ratio=1, 
+                                       data_circshift=False)
+    validset = data_spike_poisson_rate(history, pred_step_p1, p1_bs, 'valid', if_binned=False, 
+                                       neuron_type=neuron_type, recording='pt', length_ratio=1, 
+                                       data_circshift=False)
     train_loader = DL_Py(trainset, batch_size=1, shuffle=True) 
     valid_loader = DL_Py(validset, batch_size=1, shuffle=True)
 else:
-    trainset = LNP_perturb_bin(history, pred_step_p1, p1_bs, 'train', data_length_ratio)
-    validset = LNP_perturb_bin(history, pred_step_p1, p1_bs, 'valid', data_length_ratio)
-    #testset = LNP_perturb_bin(history, pred_step, p1_bs, 'test')
+    trainset = data_spike_poisson_rate(history, pred_step_p1, p1_bs, 'train', if_binned=False, 
+                                       neuron_type=neuron_type, recording='eq', length_ratio=1, 
+                                       data_circshift=False)
+    validset = data_spike_poisson_rate(history, pred_step_p1, p1_bs, 'valid', if_binned=False, 
+                                       neuron_type=neuron_type, recording='eq', length_ratio=1, 
+                                       data_circshift=False)
     train_loader = DL_Py(trainset, batch_size=1, shuffle=True) 
     valid_loader = DL_Py(validset, batch_size=1, shuffle=True)
-    #test_loader = DL_Py(testset, batch_size=1, shuffle=True)
+
+circshift_edge = np.zeros((num_nodes, num_nodes))
+circshift_edge[:, 0] = 1
+circshift_edge[0, :] = 1
+circshift_edge[0, 0] = 0
+
+edge_cs = np.where(circshift_edge)
+edge_cs = np.array([edge_cs[0], edge_cs[1]], dtype=np.int64)
+edge_cs = torch.LongTensor(edge_cs)
+edge_cs = edge_cs.to(device)
 
 def train_perturb(epoch, best_val_loss):
     t = time.time()
@@ -421,10 +448,18 @@ def train_eq_only(epoch, best_val_loss):
 
         optimizer.zero_grad()
 
-        _, z1_corr = adj_inf_model(gts_input, edge_idx)
-        z1_corr = make_z_sym_gts(z1_corr, num_nodes, device, args.symmode)
+        if args.adj_infstyle == 'complete':
+            _, z1_corr = adj_inf_model(gts_input, edge_idx)
+            z1_corr = make_z_sym_gts(z1_corr, num_nodes, device, args.symmode)
+        elif args.adj_infstyle == 'circshift':
+            _, z1_corr = adj_inf_model(gts_input, edge_cs)
+        else:
+            assert False, 'Try complete/cicrshift for adj_infstyle'
+
         z1 = -torch.sigmoid(z1_corr)
         z1 = z1.reshape(-1, 1)
+        if args.infstyle == 'circshift':
+            z1 = circshift_z_nodemode(z1, num_nodes, 1)
 
         out_p1 = decoder(x_spk, edge_idx, z1, pred_step_p1)
         loss_recon_p1 = F.poisson_nll_loss(out_p1.squeeze(), tar_spk, log_input=True)
@@ -449,10 +484,18 @@ def train_eq_only(epoch, best_val_loss):
             
             optimizer.zero_grad()
 
-            _, z1_corr = adj_inf_model(gts_input, edge_idx)
-            z1_corr = make_z_sym_gts(z1_corr, num_nodes, device, args.symmode)
+            if args.adj_infstyle == 'complete':
+                _, z1_corr = adj_inf_model(gts_input, edge_idx)
+                z1_corr = make_z_sym_gts(z1_corr, num_nodes, device, args.symmode)
+            elif args.adj_infstyle == 'circshift':
+                _, z1_corr = adj_inf_model(gts_input, edge_cs)
+            else:
+                assert False, 'Try complete/cicrshift for adj_infstyle'
+
             z1 = -torch.sigmoid(z1_corr)
             z1 = z1.reshape(-1, 1)
+            if args.infstyle == 'circshift':
+                z1 = circshift_z_nodemode(z1, num_nodes, 1)
 
             out_p1 = decoder(x_spk, edge_idx, z1, pred_step_p1)
             loss_recon_p1 = F.poisson_nll_loss(out_p1.squeeze(), tar_spk, log_input=True)
@@ -634,6 +677,8 @@ def train_perturb_target(epoch, best_val_p1, best_val_p2):
         loss = np.array([np.mean(poisson_p1_train), np.mean(poisson_p2_train), np.mean(z_loss_train), 
                          np.mean(poisson_p1_valid), np.mean(poisson_p2_valid), np.mean(z_loss_valid)])
     return np.mean(poisson_p1_valid), np.mean(poisson_p2_valid), loss
+
+
 
 loss_list = []
 best_val_loss = np.inf

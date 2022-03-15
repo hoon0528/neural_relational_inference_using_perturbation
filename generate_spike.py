@@ -715,15 +715,25 @@ class LNP_perturb_bin_tar_plot(Dataset):
         lam_ins = self.lam_ins[:, idx, :, :]
         return spk_ins, spk_tar, lam_tar, lam_ins, self.edge_idx
 
-class LNP_perturb_bin_circshift_tar(Dataset):
-    def __init__(self, pre_step, pred_step, p1_bs, dataset, length_ratio):
-        '''For dataset, use (train, valid or test)'''
-        self.spike_mat = np.load('data/spk_bin.npy')
-        self.lam_mat = np.load('data/lam_bin.npy')
-        self.history = pre_step
+class data_spike_poisson_rate(Dataset):
+    def __init__(self, history, pred_step, p1_bs, dataset, if_binned, 
+                 neuron_type, recording, length_ratio, data_circshift):
+        '''
+        For dataset, use (train, valid or test)
+        recording: {eq, pt} Equilibrium or Perturbation
+        neuron_type: {LNP, ring}
+        '''
+        if if_binned:
+            self.spike_mat = np.load('data/spk_bin_{}_{}.npy'.format(neuron_type, recording))
+            self.lam_mat = np.load('data/lam_bin_{}_{}.npy'.format(neuron_type, recording))
+        else:
+            self.spike_mat = np.load('data/spk_raw_{}_{}.npy'.format(neuron_type, recording))
+            self.lam_mat = np.load('data/lam_raw_{}_{}.npy'.format(neuron_type, recording))
+        self.history = history
         self.pred = pred_step
         self.phase1_batchsize = p1_bs
         self.dataset = dataset
+        self.data_cs = data_circshift
 
         spike_whole = torch.FloatTensor(self.spike_mat)
         lam_whole = torch.FloatTensor(self.lam_mat)
@@ -737,33 +747,31 @@ class LNP_perturb_bin_circshift_tar(Dataset):
         idx_tr_end = int(data_length*0.8)
         idx_val_end = int(data_length*0.9)
         idx_test_end = data_length
+
         if dataset == 'train':
-            iter_step = int(np.floor(data_length*0.8 / history) - 1)            
+            iter_step = int(np.floor((data_length*0.8-history) / pred_step) - 1)            
             spike_whole = spike_whole[:, :idx_tr_end]
             lam_whole = lam_whole[:, :idx_tr_end]
         elif dataset == 'valid':
-            iter_step = int(np.floor(data_length*0.1 / history) - 1)
+            iter_step = int(np.floor((data_length*0.1-history) / pred_step) - 1)
             spike_whole = spike_whole[:, idx_tr_end:idx_val_end]
             lam_whole = lam_whole[:, idx_tr_end:idx_val_end]
         elif dataset == 'test':
             iter_step = int(np.floor((data_length*0.1-history) / pred_step) - 1)
-            spike_whole = spike_whole[:, idx_val_end:data_length]
-            lam_whole = lam_whole[:, idx_val_end:data_length]
+            spike_whole = spike_whole[:, idx_val_end:idx_test_end]
+            lam_whole = lam_whole[:, idx_val_end:idx_test_end]
         else:
             assert False, 'Invalid dataset, put train/valid/test'
         # Memory Issue of getting 48K steps during Training Phase 2
         phase1_batch = self.phase1_batchsize
         
-        edge_circshift = np.zeros((num_neurons, num_neurons))
-        edge_circshift[0, :] = 1
-        edge_circshift[:, 0] = 1
-        edge_circshift[0, 0] = 0
-        edge_idx_circshift = np.where(edge_circshift)
-        edge_idx_circshift = np.array([edge_idx_circshift[0], edge_idx_circshift[1]], dtype=np.int64)
+        edge_fullyconnected = np.ones((num_neurons, num_neurons)) - np.eye(num_neurons)
+        edge_idx_fullyconnected = np.where(edge_fullyconnected)
+        edge_idx_fullyconnected = np.array([edge_idx_fullyconnected[0], edge_idx_fullyconnected[1]], dtype=np.int64)
 
         spike_whole = torch.FloatTensor(spike_whole)
         lam_whole = torch.FloatTensor(lam_whole)
-        self.edge_idx = torch.LongTensor(edge_idx_circshift)
+        self.edge_idx = torch.LongTensor(edge_idx_fullyconnected)
 
         spike_window = []
         spike_target = []
@@ -771,7 +779,8 @@ class LNP_perturb_bin_circshift_tar(Dataset):
 
         for i in tqdm(range(iter_step)):
             if (dataset == 'train') or (dataset == 'valid'):
-                step = i * history
+                #step = i * history
+                step = i * pred_step
                 spike_window.append(spike_whole[:, step:step+window_size])
                 spike_target.append(spike_whole[:, step+history:step+history+pred_step])
                 lam_target.append(lam_whole[:, step+history:step+history+pred_step])
@@ -800,36 +809,54 @@ class LNP_perturb_bin_circshift_tar(Dataset):
         spike_window_whole = spike_window_whole.reshape(num_neurons, -1, phase1_batch, window_size)
         spike_target_whole = spike_target_whole.reshape(num_neurons, -1, phase1_batch, pred_step)
         lam_target_whole = lam_target_whole.reshape(num_neurons, -1, phase1_batch, pred_step)
-        window_nodewise_size = [num_neurons] + list(spike_window_whole.shape)
         
-        #[nodes, 1, num_batchs, p1_bs, window_size] > [nodes, nodes, num_batchs, p1_bs, window_size]
-        spike_window_nodewise = torch.empty(window_nodewise_size)
-    
-        for node_index in range(num_neurons):
-            spike_window_nodewise[:,node_index,:,:,:] = torch.roll(spike_window_whole, shifts=node_index, dims=0)
+        if data_circshift:
+            window_nodewise_size = [num_neurons] + list(spike_window_whole.shape)
+            
+            #[nodes, 1, num_batchs, p1_bs, window_size] > [nodes, nodes, num_batchs, p1_bs, window_size]
+            spike_window_nodewise = torch.empty(window_nodewise_size)
+        
+            for node_index in range(num_neurons):
+                spike_window_nodewise[:,node_index,:,:,:] = torch.roll(spike_window_whole, shifts=node_index, dims=0)
 
-        spike_window_nodewise = spike_window_nodewise.reshape(num_neurons, -1, phase1_batch, window_size)
-        spike_target_whole = spike_target_whole.reshape(-1, phase1_batch, pred_step)
-        lam_target_whole = lam_target_whole.reshape(-1, phase1_batch, pred_step)
+            spike_window_nodewise = spike_window_nodewise.reshape(num_neurons, -1, phase1_batch, window_size)
+            spike_target_whole = spike_target_whole.reshape(-1, phase1_batch, pred_step)
+            lam_target_whole = lam_target_whole.reshape(-1, phase1_batch, pred_step)
 
-        self.x = spike_window_nodewise
-        self.y = spike_target_whole
-        self.y_lam = lam_target_whole
-        self.len = self.x.shape[1]
+            self.x = spike_window_nodewise
+            self.y = spike_target_whole
+            self.y_lam = lam_target_whole
+            self.len = self.x.shape[1]
+
+        else:
+            self.x = spike_window_whole
+            self.y = spike_target_whole
+            self.y_lam = lam_target_whole
+            self.len = spike_window_whole.shape[1]
 
     def __len__(self):
         return self.len
 
     def __getitem__(self, idx):
-        if self.dataset == 'train' or self.dataset == 'valid':
-            x = self.x[:, idx, :, :]
-            target = self.y[idx, :, :]
-            return x, target, self.edge_idx
-        elif self.dataset == 'test':
-            x = self.x[:, idx, :, :]
-            target = self.y[idx, :, :]
-            target_lam = self.y_lam[idx, :, :]
-            return x, target, target_lam, self.edge_idx
+        if self.data_cs:
+            if self.dataset == 'train' or self.dataset == 'valid':
+                x = self.x[:, idx, :, :]
+                target = self.y[idx, :, :]
+                return x, target, self.edge_idx
+            elif self.dataset == 'test':
+                x = self.x[:, idx, :, :]
+                target = self.y[idx, :, :]
+                target_lam = self.y_lam[idx, :, :]
+                return x, target, target_lam, self.edge_idx
+            else:
+                assert False, 'Invalid dataset, put train/valid/test'
         else:
-            assert False, 'Invalid dataset, put train/valid/test'
-            
+            if self.dataset == 'train' or self.dataset == 'valid':
+                x = self.x[:, idx, :, :]
+                y = self.y[:, idx, :, :]
+                return x, y, self.edge_idx
+            else:
+                x = self.x[:, idx, :, :]
+                y = self.y[:, idx, :, :]
+                lam_tar = self.y_lam[:, idx, :, :]
+                return x, y, lam_tar, self.edge_idx
